@@ -1,0 +1,24 @@
+{
+  "name": "factioner-monorepo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Factioner Monorepo: Multi-language Service Pooling & Resilience Engine (TypeScript & Rust)",
+  "workspaces": [
+    "packages/ts"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace=@factioner/ts && cd packages/rust && cargo build",
+    "test:ts": "npm run test --workspace=@factioner/ts",
+    "test:rust": "cd packages/rust && cargo test",
+    "test:python": "python -m pytest packages/python -q",
+    "test": "npm run test:ts && npm run test:rust",
+    "demo:ts": "node packages/ts/dist/cli.js",
+    "demo:rust": "cd packages/rust && cargo run --release"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sunilksundaram/factioner.git"
+  },
+  "author": "Sunil K Sundaram <sunil.ksundaram@gmail.com>"
+}

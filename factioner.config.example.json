@@ -1,0 +1,71 @@
+{
+  "gateway": {
+    "host": "127.0.0.1",
+    "port": 8080,
+    "apiKey": null,
+    "maxBodyBytes": 10485760
+  },
+  "pools": [
+    {
+      "name": "llm-prod-pool",
+      "serviceType": "llm",
+      "maxRetries": 3,
+      "enablePiiRedaction": false,
+      "backpressure": {
+        "maxQueueSize": 100,
+        "admissionPolicy": "drop_oldest",
+        "queueTimeoutMs": 10000,
+        "executionTimeoutMs": 30000,
+        "admissionWaitTimeoutMs": 3000,
+        "sheddingThresholdPercentage": 85,
+        "globalRetryBudgetPercentage": 20
+      },
+      "circuitBreaker": {
+        "failureThresholdPercentage": 50,
+        "minimumRequestVolume": 5,
+        "samplingWindowMs": 10000,
+        "coolingOffDurationMs": 3000,
+        "halfOpenTrialSuccesses": 2
+      },
+      "endpoints": [
+        {
+          "id": "azure-openai-eastus",
+          "url": "https://eastus.api.cognitive.microsoft.com/openai/deployments/gpt-4o",
+          "maxConcurrency": 4,
+          "budget": { "rpm": 600, "tpm": 30000 },
+          "weight": 1.0,
+          "priorityTier": 0,
+          "costPerRequest": 1.0,
+          "timeoutMs": 5000,
+          "metadata": {}
+        },
+        {
+          "id": "openai-direct-primary",
+          "url": "https://api.openai.com/v1/chat/completions",
+          "maxConcurrency": 4,
+          "budget": { "rpm": 600, "tpm": 30000 },
+          "weight": 1.0,
+          "priorityTier": 0,
+          "costPerRequest": 1.0,
+          "timeoutMs": 5000,
+          "metadata": {}
+        }
+      ]
+    }
+  ],
+  "tenants": [
+    {
+      "id": "tenant-enterprise-gold",
+      "maxRps": 30,
+      "maxTpm": 20000,
+      "maxConcurrency": 10
+    },
+    {
+      "id": "tenant-free-tier",
+      "maxRps": 3,
+      "maxTpm": 1000,
+      "maxConcurrency": 1,
+      "maxAllowedPriority": "High"
+    }
+  ]
+}

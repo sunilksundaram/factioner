@@ -1,0 +1,37 @@
+[package]
+name = "factioner"
+version = "0.1.0"
+edition = "2021"
+description = "High-Performance Universal Service Resource Pooling & Resilience Engine"
+license = "Apache-2.0"
+repository = "https://github.com/sunilksundaram/factioner"
+homepage = "https://github.com/sunilksundaram/factioner"
+readme = "README.md"
+authors = ["Sunil K Sundaram <sunil.ksundaram@gmail.com>"]
+keywords = ["pool", "backpressure", "resilience", "circuit-breaker", "llm"]
+categories = ["asynchronous", "network-programming"]
+
+[dependencies]
+tokio = { version = "1.42", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+async-trait = "0.1"
+rand = "0.8"
+uuid = { version = "1.11", features = ["v4", "fast-rng"] }
+aes-gcm = "0.10"
+sha2 = "0.10"
+hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+axum = { version = "0.7", features = ["macros"] }
+tower-http = { version = "0.6", features = ["cors"] }
+futures = "0.3"
+tokio-stream = "0.1"
+bytes = "1"
+
+[[bin]]
+name = "factioner"
+path = "src/main.rs"
+
+[lib]
+name = "factioner"
+path = "src/lib.rs"

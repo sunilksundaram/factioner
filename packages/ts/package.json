@@ -1,0 +1,41 @@
+{
+  "name": "@factioner/ts",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Factioner TypeScript Core: Universal Adaptive Service Resource Pooling, Backpressure & Resilience Engine",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "start": "tsc && node dist/cli.js",
+    "test": "tsc && node --test dist/**/*.test.js",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "service-pool",
+    "backpressure",
+    "resilience",
+    "circuit-breaker",
+    "llm",
+    "document-intelligence",
+    "factioner"
+  ],
+  "author": "Sunil K Sundaram <sunil.ksundaram@gmail.com>",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sunilksundaram/factioner.git",
+    "directory": "packages/ts"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.1",
+    "typescript": "^5.7.2"
+  }
+}

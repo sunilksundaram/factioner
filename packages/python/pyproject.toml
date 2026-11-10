@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "factioner"
+version = "0.1.0"
+description = "Factioner — service pooling & resilience helpers (Python companion package)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Sunil K Sundaram", email = "sunil.ksundaram@gmail.com" }]
+keywords = ["factioner", "pool", "backpressure", "resilience"]
+classifiers = [
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/sunilksundaram/factioner"
+Repository = "https://github.com/sunilksundaram/factioner"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]

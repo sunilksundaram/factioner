@@ -1,6 +1,10 @@
 use crate::types::{BudgetDeduction, ResourceBudgetConfig};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+const TPM_OVERSHOOT_RATIO: f64 = 1.25;
+const MAX_TPM_ESTIMATE_BIAS: f64 = 2.0;
+const TPM_BIAS_DEFAULT_MS: u64 = 30_000;
 
 struct WindowState {
     consumed: f64,
@@ -12,10 +16,11 @@ struct LimiterInner {
     tpm_state: WindowState,
     pages_state: WindowState,
     rps_state: WindowState,
-    /// Temporary effective RPM (≤ baseline); None = use baseline.
     effective_rpm: Option<f64>,
-    /// When the temporary RPM tightening expires.
     rpm_signal_until: Option<Instant>,
+    effective_tpm: Option<f64>,
+    tpm_signal_until: Option<Instant>,
+    tpm_estimate_bias: f64,
     signal_tightened: bool,
 }
 
@@ -58,6 +63,9 @@ impl MultiResourceLimiter {
                 },
                 effective_rpm: None,
                 rpm_signal_until: None,
+                effective_tpm: None,
+                tpm_signal_until: None,
+                tpm_estimate_bias: 1.0,
                 signal_tightened: false,
             }),
         }
@@ -76,9 +84,17 @@ impl MultiResourceLimiter {
             if now >= until {
                 inner.effective_rpm = None;
                 inner.rpm_signal_until = None;
-                inner.signal_tightened = false;
             }
         }
+        if let Some(until) = inner.tpm_signal_until {
+            if now >= until {
+                inner.effective_tpm = None;
+                inner.tpm_signal_until = None;
+                inner.tpm_estimate_bias = 1.0;
+            }
+        }
+        inner.signal_tightened =
+            inner.rpm_signal_until.is_some() || inner.tpm_signal_until.is_some();
     }
 
     fn current_rpm_limit(&self, inner: &LimiterInner) -> Option<f64> {
@@ -90,19 +106,43 @@ impl MultiResourceLimiter {
         }
     }
 
-    /// Temporarily tighten effective RPM on OVERLOADED + Retry-After.
+    fn current_tpm_limit(&self, inner: &LimiterInner) -> Option<f64> {
+        match (self.tpm_limit, inner.effective_tpm) {
+            (Some(base), Some(eff)) => Some(eff.min(base)),
+            (Some(base), None) => Some(base),
+            (None, Some(eff)) => Some(eff),
+            (None, None) => None,
+        }
+    }
+
+    fn tighten_tpm(inner: &mut LimiterInner, baseline: f64, now: Instant, retry_after_ms: u64, factor: f64) {
+        let tightened = (baseline * factor).max(1.0).min(baseline);
+        inner.effective_tpm = Some(tightened);
+        let until = now + Duration::from_millis(retry_after_ms.max(1));
+        inner.tpm_signal_until = Some(match inner.tpm_signal_until {
+            Some(prev) if prev > until => prev,
+            _ => until,
+        });
+        inner.signal_tightened = true;
+    }
+
+    /// Temporarily tighten effective RPM and TPM on OVERLOADED + Retry-After.
     /// Never raises above the declared baseline.
     pub fn apply_overload_signal(&self, retry_after_ms: u64) {
-        let Some(baseline) = self.rpm_limit else {
-            return;
-        };
         let now = Instant::now();
         let mut inner = poison_ok(self.inner.lock());
-        // Halve effective RPM (floor at 1) until retry-after elapses.
-        let tightened = (baseline / 2.0).max(1.0).min(baseline);
-        inner.effective_rpm = Some(tightened);
-        inner.rpm_signal_until = Some(now + std::time::Duration::from_millis(retry_after_ms.max(1)));
-        inner.signal_tightened = true;
+        let until_ms = retry_after_ms.max(1);
+
+        if let Some(baseline) = self.rpm_limit {
+            let tightened = (baseline / 2.0).max(1.0).min(baseline);
+            inner.effective_rpm = Some(tightened);
+            inner.rpm_signal_until = Some(now + Duration::from_millis(until_ms));
+            inner.signal_tightened = true;
+        }
+
+        if let Some(baseline) = self.tpm_limit {
+            Self::tighten_tpm(&mut inner, baseline, now, until_ms, 0.5);
+        }
     }
 
     pub fn effective_rpm(&self) -> Option<f64> {
@@ -113,7 +153,17 @@ impl MultiResourceLimiter {
     }
 
     pub fn effective_tpm(&self) -> Option<f64> {
-        self.tpm_limit
+        let now = Instant::now();
+        let mut inner = poison_ok(self.inner.lock());
+        Self::restore_signal_if_expired(&mut inner, now);
+        self.current_tpm_limit(&inner)
+    }
+
+    pub fn tpm_estimate_bias(&self) -> f64 {
+        let now = Instant::now();
+        let mut inner = poison_ok(self.inner.lock());
+        Self::restore_signal_if_expired(&mut inner, now);
+        inner.tpm_estimate_bias
     }
 
     pub fn is_signal_tightened(&self) -> bool {
@@ -136,10 +186,11 @@ impl MultiResourceLimiter {
             }
         }
 
-        if let Some(limit) = self.tpm_limit {
+        if let Some(limit) = self.current_tpm_limit(&inner) {
             if let Some(needed) = estimate.tpm {
                 Self::refresh_window(&mut inner.tpm_state, 60.0, now);
-                if inner.tpm_state.consumed + needed > limit {
+                let biased = needed * inner.tpm_estimate_bias;
+                if inner.tpm_state.consumed + biased > limit {
                     return false;
                 }
             }
@@ -172,7 +223,7 @@ impl MultiResourceLimiter {
         Self::restore_signal_if_expired(&mut inner, now);
 
         let rpm_needed = estimate.rpm.unwrap_or(1.0);
-        let tpm_needed = estimate.tpm.unwrap_or(0.0);
+        let tpm_needed = estimate.tpm.unwrap_or(0.0) * inner.tpm_estimate_bias;
         let pages_needed = estimate.pages.unwrap_or(0.0);
         let rps_needed = estimate.rps.unwrap_or(1.0);
 
@@ -183,7 +234,7 @@ impl MultiResourceLimiter {
             }
         }
 
-        if let Some(limit) = self.tpm_limit {
+        if let Some(limit) = self.current_tpm_limit(&inner) {
             if estimate.tpm.is_some() {
                 Self::refresh_window(&mut inner.tpm_state, 60.0, now);
                 if inner.tpm_state.consumed + tpm_needed > limit {
@@ -233,6 +284,15 @@ impl MultiResourceLimiter {
             let act_tpm = actual.tpm.unwrap_or(0.0);
             Self::refresh_window(&mut inner.tpm_state, 60.0, now);
             inner.tpm_state.consumed = (inner.tpm_state.consumed + (act_tpm - est_tpm)).max(0.0);
+
+            if est_tpm > 0.0 && act_tpm > est_tpm * TPM_OVERSHOOT_RATIO {
+                if let Some(baseline) = self.tpm_limit {
+                    let ratio = act_tpm / est_tpm;
+                    inner.tpm_estimate_bias = inner.tpm_estimate_bias.max(ratio).min(MAX_TPM_ESTIMATE_BIAS);
+                    let factor = 1.0 / ratio.min(2.0);
+                    Self::tighten_tpm(&mut inner, baseline, now, TPM_BIAS_DEFAULT_MS, factor);
+                }
+            }
         }
 
         if self.pages_limit.is_some() {
@@ -252,7 +312,8 @@ impl MultiResourceLimiter {
         }
         if self.tpm_limit.is_some() {
             if let Some(tpm) = deduction.tpm {
-                inner.tpm_state.consumed = (inner.tpm_state.consumed - tpm).max(0.0);
+                let bias = inner.tpm_estimate_bias;
+                inner.tpm_state.consumed = (inner.tpm_state.consumed - tpm * bias).max(0.0);
             }
         }
         if self.pages_limit.is_some() {

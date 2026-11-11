@@ -21,4 +21,6 @@ Cargo.lock
 packages/rust/Cargo.lock
 factioner.config.json
 faction.config.json
+.factioner-spill/
 *.bak
+.cursor

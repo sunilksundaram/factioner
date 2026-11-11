@@ -2,6 +2,8 @@ import { ServiceAdapter, UnaryExecutionResult, StreamExecutionResult } from './b
 import { EndpointConfig, BudgetDeduction, FailureClassification } from '../types/index.js';
 import { ErrorClassifier } from '../resilience/retry-manager.js';
 import { headersToRecord } from '../utils/headers.js';
+import { estimateTokensFromParts } from '../utils/tokenizer.js';
+import { resolveSpilledPayload } from '../spill/blob-spill.js';
 
 export interface LLMMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
@@ -37,8 +39,8 @@ export class LLMAdapter implements ServiceAdapter<LLMRequest, LLMResponse> {
   public readonly name = 'llm-universal-adapter';
 
   public estimateBudget(payload: LLMRequest) {
-    const chars = payload.messages.reduce((n, m) => n + (m.content?.length ?? 0), 0);
-    return { rpm: 1, tpm: Math.ceil(chars / 4) + (payload.maxTokens ?? 1024) };
+    const promptTokens = estimateTokensFromParts(payload.messages.map(m => m.content));
+    return { rpm: 1, tpm: promptTokens + (payload.maxTokens ?? 1024) };
   }
 
   public validatePayload(payload: LLMRequest): void {
@@ -53,6 +55,7 @@ export class LLMAdapter implements ServiceAdapter<LLMRequest, LLMResponse> {
     signal: AbortSignal,
     authHeaders: Record<string, string>
   ): Promise<UnaryExecutionResult<LLMResponse>> {
+    payload = resolveSpilledPayload(payload as unknown as Record<string, unknown>) as unknown as LLMRequest;
     const isAnthropic = endpoint.url.includes('anthropic.com');
     const isGemini = endpoint.url.includes('googleapis.com');
 
@@ -157,6 +160,7 @@ export class LLMAdapter implements ServiceAdapter<LLMRequest, LLMResponse> {
     signal: AbortSignal,
     authHeaders: Record<string, string>
   ): Promise<StreamExecutionResult> {
+    payload = resolveSpilledPayload(payload as unknown as Record<string, unknown>) as unknown as LLMRequest;
     const isAnthropic = endpoint.url.includes('anthropic.com');
     const isGemini = endpoint.url.includes('googleapis.com');
     const defaultModel = (endpoint.metadata?.model as string) || payload.model || 'gpt-4o';

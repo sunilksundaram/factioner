@@ -33,15 +33,22 @@ Admission and tenant denials return **429** with `error`, `code` (`QUEUE_FULL` |
 
 ## Capacity precedence
 
-1. **Runtime signals** — overload + Retry-After temporarily tighten effective RPM
+1. **Runtime signals** — overload + Retry-After temporarily tighten effective RPM **and TPM**; usage overshoot inflates TPM estimate bias (bounded) then restores
 2. **Config / env** — `FACTIONER_CONFIG` (+ legacy `FACTION_CONFIG`) and endpoint overlays
 3. **In-code** defaults
+
+## Payload spill + tokenizer
+
+- Gateway `maxBodyBytes` hard-rejects oversized bodies (default 10 MiB).
+- Optional `spillDir` / `spillThresholdBytes` (default 256 KiB): large `base64Source`, embedding `input`, and LLM `messages[].content` are written to local spill files as `spill://…` so the in-memory queue does not retain multi-MB blobs. Adapters resolve URIs at execute time.
+- Token estimates use a shared lightweight tokenizer (`~4 chars/token` with word floor), not a full BPE vocab.
 
 ## Deferred
 
 - Multi-replica shared TPM/RPM
 - OAuth2 refresh / Managed Identity
-- Payload spill to object storage
+- Remote object-storage spill backends (S3 / Azure Blob)
 - OpenTelemetry exporters
 - Sticky routing implementation
 - E1 QuotaProbe learn-caps
+

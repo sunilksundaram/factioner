@@ -35,15 +35,28 @@ Shared docs: [gateway contract](docs/gateway-contract.md) · [golden scenarios](
 
 ### Capacity precedence
 
-1. **Runtime signals** (429 / Retry-After → tighten effective RPM, then restore)
+1. **Runtime signals** (429 / Retry-After → tighten effective RPM/TPM; usage overshoot → TPM estimate bias; then restore)
 2. **Config / env** (`FACTIONER_CONFIG` JSON + `FACTIONER_ENDPOINT_<ID>_TPM` / `_RPM` / `_API_KEY`; legacy `FACTION_*` still accepted)
 3. **In-code** endpoint / tenant defaults
 
-Sticky/affinity routing and QuotaProbe learn-caps (E1) are deferred.
+Local blob spill (`gateway.spillDir`) and the shared tokenizer are supported. Sticky/affinity routing and QuotaProbe learn-caps (E1) remain deferred.
 
-**Deferred:** multi-replica shared TPM/RPM, OAuth2 / Managed Identity, blob spill, OpenTelemetry exporters.
+**Deferred:** multi-replica shared TPM/RPM, OAuth2 / Managed Identity, remote object-storage spill, OpenTelemetry exporters.
 
 ---
+
+## Bootstrap
+
+```ts
+import { bootstrapFromConfig, GatewayServer } from '@factioner/ts';
+
+// Production: real adapters selected by pools[].serviceType
+const boot = bootstrapFromConfig({ useMock: false });
+const server = new GatewayServer(boot.gatewayOptions, boot.registry);
+await server.start();
+```
+
+`serviceType` → adapter: `llm`, `document_intelligence` (aliases: `ocr`, `form_recognizer`), `embedding`, `custom`. Set `FACTIONER_USE_MOCK=1` or `{ useMock: true }` for offline demos.
 
 ## Quick Commands
 

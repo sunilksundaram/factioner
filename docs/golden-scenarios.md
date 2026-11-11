@@ -10,3 +10,5 @@ Both `packages/ts` and `packages/rust` test suites should cover:
 6. **Idempotency** — Same key returns one in-flight / cached result.
 7. **Stream + operation** — Stream yields tokens; operation submit + poll succeeds.
 8. **Secret redact** — `api_key=secret` → `api_key=[REDACTED]`; raw secret never in redacted text.
+9. **E3 TPM bias** — Overload halves effective RPM and TPM; reconcile overshoot raises estimate bias and tightens TPM, then restores.
+10. **Spill + tokenizer** — Large fields spill to `spill://` and resolve round-trip; token estimate ≥ word/char heuristic.

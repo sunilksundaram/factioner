@@ -21,6 +21,8 @@ pub struct GatewayFileConfig {
     pub host: Option<String>,
     pub port: Option<u16>,
     pub max_body_bytes: Option<usize>,
+    pub spill_dir: Option<String>,
+    pub spill_threshold_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

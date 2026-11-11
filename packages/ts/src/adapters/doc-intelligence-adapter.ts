@@ -7,6 +7,7 @@ import {
 import { EndpointConfig, FailureClassification, BudgetDeduction } from '../types/index.js';
 import { ErrorClassifier } from '../resilience/retry-manager.js';
 import { headersToRecord } from '../utils/headers.js';
+import { resolveSpilledPayload } from '../spill/blob-spill.js';
 
 export interface DocumentAnalysisRequest {
   modelId?: string;
@@ -99,6 +100,7 @@ export class DocumentIntelligenceAdapter
     signal: AbortSignal,
     authHeaders: Record<string, string>
   ): Promise<OperationSubmissionResult> {
+    payload = resolveSpilledPayload(payload as unknown as Record<string, unknown>) as unknown as DocumentAnalysisRequest;
     const modelId = payload.modelId || (endpoint.metadata?.defaultModel as string) || 'prebuilt-layout';
     const targetUrl = endpoint.url.includes('{modelId}')
       ? endpoint.url.replace('{modelId}', encodeURIComponent(modelId))

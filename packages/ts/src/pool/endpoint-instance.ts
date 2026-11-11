@@ -185,6 +185,7 @@ export class EndpointInstance {
       budgetUsage: usage,
       effectiveRpm: this.budgetLimiter.getEffectiveRpm(),
       effectiveTpm: this.budgetLimiter.getEffectiveTpm(),
+      tpmEstimateBias: this.budgetLimiter.getTpmEstimateBias(),
       signalTightened: this.budgetLimiter.isSignalTightened()
     };
   }

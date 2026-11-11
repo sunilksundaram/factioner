@@ -2,6 +2,8 @@ import { ServiceAdapter, UnaryExecutionResult } from './base-adapter.js';
 import { EndpointConfig, FailureClassification } from '../types/index.js';
 import { ErrorClassifier } from '../resilience/retry-manager.js';
 import { headersToRecord } from '../utils/headers.js';
+import { estimateTokens, estimateTokensFromParts } from '../utils/tokenizer.js';
+import { resolveSpilledPayload } from '../spill/blob-spill.js';
 
 export interface EmbeddingRequest {
   model?: string;
@@ -32,10 +34,10 @@ export class EmbeddingAdapter implements ServiceAdapter<EmbeddingRequest, Embedd
   public readonly name = 'embedding-service-adapter';
 
   public estimateBudget(payload: EmbeddingRequest) {
-    const textLen = typeof payload.input === 'string'
-      ? payload.input.length
-      : payload.input.reduce((n, s) => n + (s?.length ?? 0), 0);
-    return { rpm: 1, tpm: Math.max(1, Math.ceil(textLen / 4)) };
+    const tokens = typeof payload.input === 'string'
+      ? estimateTokens(payload.input)
+      : estimateTokensFromParts(payload.input);
+    return { rpm: 1, tpm: Math.max(1, tokens) };
   }
 
   public validatePayload(payload: EmbeddingRequest): void {
@@ -53,6 +55,7 @@ export class EmbeddingAdapter implements ServiceAdapter<EmbeddingRequest, Embedd
     signal: AbortSignal,
     authHeaders: Record<string, string>
   ): Promise<UnaryExecutionResult<EmbeddingResponse>> {
+    payload = resolveSpilledPayload(payload as unknown as Record<string, unknown>) as unknown as EmbeddingRequest;
     const defaultModel = (endpoint.metadata?.model as string) || payload.model || 'text-embedding-3-small';
     const body = JSON.stringify({
       model: defaultModel,
@@ -83,7 +86,11 @@ export class EmbeddingAdapter implements ServiceAdapter<EmbeddingRequest, Embedd
     }
 
     const data: any = await res.json();
-    const totalTokens = data.usage?.total_tokens ?? (typeof payload.input === 'string' ? Math.ceil(payload.input.length / 4) : 100);
+    const totalTokens = data.usage?.total_tokens ?? (
+      typeof payload.input === 'string'
+        ? estimateTokens(payload.input)
+        : estimateTokensFromParts(payload.input)
+    );
 
     return {
       data: {

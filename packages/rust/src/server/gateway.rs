@@ -1,16 +1,18 @@
 use crate::pool::PoolRegistry;
+use crate::spill::{configure_global_spill, BlobSpillStore};
 use crate::types::{JobPriority, SubmitOptions};
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::stream::StreamExt;
-use serde_json::json;
+use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
@@ -20,6 +22,9 @@ pub struct GatewayState {
     pub api_key: Option<String>,
     pub allow_unauthenticated: bool,
     pub started_at: Instant,
+    pub spill: Option<Arc<BlobSpillStore>>,
+    /// Spilled payloads retained for in-flight LROs until done/cancel.
+    pub operation_spills: Arc<Mutex<HashMap<String, Value>>>,
 }
 
 pub struct GatewayServer {
@@ -27,6 +32,7 @@ pub struct GatewayServer {
     host: String,
     port: u16,
     cors_origins: Vec<String>,
+    max_body_bytes: usize,
 }
 
 impl GatewayServer {
@@ -42,15 +48,29 @@ impl GatewayServer {
                 api_key,
                 allow_unauthenticated: false,
                 started_at: Instant::now(),
+                spill: None,
+                operation_spills: Arc::new(Mutex::new(HashMap::new())),
             },
             host: host.to_string(),
             port,
             cors_origins: Vec::new(),
+            max_body_bytes: 10 * 1024 * 1024,
         }
     }
 
     pub fn with_cors(mut self, origins: Vec<String>) -> Self {
         self.cors_origins = origins;
+        self
+    }
+
+    pub fn with_max_body_bytes(mut self, max_body_bytes: usize) -> Self {
+        self.max_body_bytes = max_body_bytes;
+        self
+    }
+
+    pub fn with_spill(mut self, store: Arc<BlobSpillStore>) -> Self {
+        configure_global_spill(store.clone());
+        self.state.spill = Some(store);
         self
     }
 
@@ -83,6 +103,7 @@ impl GatewayServer {
                 "/v1/pools/:name/operations/:id",
                 get(poll_operation_handler).delete(cancel_operation_handler),
             )
+            .layer(DefaultBodyLimit::max(self.max_body_bytes))
             .layer(cors)
             .with_state(self.state);
 
@@ -242,9 +263,53 @@ async fn execute_handler(
     };
 
     let options = extract_submit_options(&headers);
-    match pool.execute_json(payload, options).await {
-        Ok(res) => (StatusCode::OK, Json(res)).into_response(),
-        Err(err) => error_response(err),
+    let payload = prepare_payload(&state, payload);
+    match pool.execute_json(payload.clone(), options).await {
+        Ok(res) => {
+            cleanup_payload_spills(&state, &payload);
+            (StatusCode::OK, Json(res)).into_response()
+        }
+        Err(err) => {
+            cleanup_payload_spills(&state, &payload);
+            error_response(err)
+        }
+    }
+}
+
+fn prepare_payload(state: &GatewayState, payload: serde_json::Value) -> serde_json::Value {
+    match &state.spill {
+        Some(store) => store.spill_value(payload),
+        None => payload,
+    }
+}
+
+fn cleanup_payload_spills(state: &GatewayState, payload: &serde_json::Value) {
+    if let Some(store) = &state.spill {
+        store.delete_payload_spills(payload);
+    }
+}
+
+fn operation_spill_key(pool_name: &str, operation_id: &str) -> String {
+    format!("{}::{}", pool_name, operation_id)
+}
+
+fn retain_operation_spill(state: &GatewayState, pool_name: &str, operation_id: &str, payload: Value) {
+    if state.spill.is_none() {
+        return;
+    }
+    if let Ok(mut map) = state.operation_spills.lock() {
+        map.insert(operation_spill_key(pool_name, operation_id), payload);
+    }
+}
+
+fn release_operation_spill(state: &GatewayState, pool_name: &str, operation_id: &str) {
+    let payload = state
+        .operation_spills
+        .lock()
+        .ok()
+        .and_then(|mut map| map.remove(&operation_spill_key(pool_name, operation_id)));
+    if let Some(payload) = payload {
+        cleanup_payload_spills(state, &payload);
     }
 }
 
@@ -265,8 +330,11 @@ async fn stream_handler(
     };
 
     let options = extract_submit_options(&headers);
-    match pool.stream_sse(payload, options).await {
+    let payload = prepare_payload(&state, payload);
+    match pool.stream_sse(payload.clone(), options).await {
         Ok(token_stream) => {
+            let spill = state.spill.clone();
+            let spilled = payload.clone();
             let sse_stream = token_stream
                 .map(|item| {
                     let event = match item {
@@ -275,7 +343,10 @@ async fn stream_handler(
                     };
                     Ok::<Event, Infallible>(event)
                 })
-                .chain(futures::stream::once(async {
+                .chain(futures::stream::once(async move {
+                    if let Some(store) = spill {
+                        store.delete_payload_spills(&spilled);
+                    }
                     Ok::<Event, Infallible>(Event::default().data("[DONE]"))
                 }));
             // Client disconnect drops the stream → GuardedTokenStream Drop releases lease.
@@ -283,7 +354,10 @@ async fn stream_handler(
                 .keep_alive(KeepAlive::default())
                 .into_response()
         }
-        Err(err) => error_response(err),
+        Err(err) => {
+            cleanup_payload_spills(&state, &payload);
+            error_response(err)
+        }
     }
 }
 
@@ -304,16 +378,23 @@ async fn submit_operation_handler(
     };
 
     let options = extract_submit_options(&headers);
-    match pool.submit_operation_json(payload, options).await {
-        Ok(operation_id) => (
-            StatusCode::ACCEPTED,
-            Json(json!({
-                "operationId": operation_id,
-                "status": "running"
-            })),
-        )
-            .into_response(),
-        Err(err) => error_response(err),
+    let payload = prepare_payload(&state, payload);
+    match pool.submit_operation_json(payload.clone(), options).await {
+        Ok(operation_id) => {
+            retain_operation_spill(&state, &name, &operation_id, payload);
+            (
+                StatusCode::ACCEPTED,
+                Json(json!({
+                    "operationId": operation_id,
+                    "status": "running"
+                })),
+            )
+                .into_response()
+        }
+        Err(err) => {
+            cleanup_payload_spills(&state, &payload);
+            error_response(err)
+        }
     }
 }
 
@@ -334,16 +415,21 @@ async fn poll_operation_handler(
 
     // Opaque handle — no x-endpoint-id required.
     match pool.poll_operation_json(&id).await {
-        Ok(snap) => (
-            StatusCode::OK,
-            Json(json!({
-                "operationId": id,
-                "status": snap.status,
-                "done": snap.done,
-                "data": snap.data,
-            })),
-        )
-            .into_response(),
+        Ok(snap) => {
+            if snap.done {
+                release_operation_spill(&state, &name, &id);
+            }
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "operationId": id,
+                    "status": snap.status,
+                    "done": snap.done,
+                    "data": snap.data,
+                })),
+            )
+                .into_response()
+        }
         Err(err) => {
             let status = if err.contains("not found") {
                 StatusCode::NOT_FOUND
@@ -371,15 +457,18 @@ async fn cancel_operation_handler(
     };
 
     match pool.cancel_operation_json(&id).await {
-        Ok(upstream_cancelled) => (
-            StatusCode::OK,
-            Json(json!({
-                "operationId": id,
-                "status": "cancelled",
-                "upstreamCancelled": upstream_cancelled
-            })),
-        )
-            .into_response(),
+        Ok(upstream_cancelled) => {
+            release_operation_spill(&state, &name, &id);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "operationId": id,
+                    "status": "cancelled",
+                    "upstreamCancelled": upstream_cancelled
+                })),
+            )
+                .into_response()
+        }
         Err(err) => {
             (StatusCode::BAD_GATEWAY, Json(json!({ "operationId": id, "error": err }))).into_response()
         }

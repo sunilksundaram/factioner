@@ -225,6 +225,8 @@ export interface EndpointMetrics {
   };
   effectiveRpm?: number;
   effectiveTpm?: number;
+  /** Estimate inflation from usage overshoot (1 = none). */
+  tpmEstimateBias?: number;
   signalTightened?: boolean;
 }
 

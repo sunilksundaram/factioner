@@ -5,10 +5,16 @@ use futures::stream::BoxStream;
 pub mod mock;
 pub mod generic_http;
 pub mod llm;
+pub mod doc_intelligence;
+pub mod embedding;
 
 pub use mock::MockAdapter;
 pub use generic_http::{GenericHttpAdapter, GenericHttpRequest};
 pub use llm::{LLMAdapter, LLMMessage, LLMRequest, LLMResponse};
+pub use doc_intelligence::{
+    DocumentAnalysisRequest, DocumentAnalysisResponse, DocumentIntelligenceAdapter,
+};
+pub use embedding::{EmbeddingAdapter, EmbeddingInput, EmbeddingRequest, EmbeddingResponse};
 
 #[derive(Debug)]
 pub struct AdapterError {

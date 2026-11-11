@@ -129,11 +129,15 @@ impl Stream for SseTokenStream {
 #[async_trait]
 impl ServiceAdapter<LLMRequest, LLMResponse> for LLMAdapter {
     fn estimate_budget(&self, payload: &LLMRequest) -> BudgetDeduction {
-        let chars: usize = payload.messages.iter().map(|m| m.content.len()).sum();
-        let est_tpm = (chars as f64 / 4.0).ceil() + payload.max_tokens.unwrap_or(1024) as f64;
+        let prompt_tokens: usize = payload
+            .messages
+            .iter()
+            .map(|m| crate::tokenizer::estimate_tokens(&m.content))
+            .sum();
+        let est_tpm = prompt_tokens as f64 + payload.max_tokens.unwrap_or(1024) as f64;
         BudgetDeduction {
             rpm: Some(1.0),
-            tpm: Some(est_tpm),
+            tpm: Some(est_tpm.max(1.0)),
             ..Default::default()
         }
     }
@@ -144,9 +148,24 @@ impl ServiceAdapter<LLMRequest, LLMResponse> for LLMAdapter {
         payload: &LLMRequest,
         auth_header: Option<(&str, &str)>,
     ) -> Result<(LLMResponse, BudgetDeduction), AdapterError> {
+        let resolved_messages: Vec<LLMMessage> = payload
+            .messages
+            .iter()
+            .map(|m| LLMMessage {
+                role: m.role.clone(),
+                content: crate::spill::resolve_spilled_string(&m.content)
+                    .unwrap_or_else(|| m.content.clone()),
+            })
+            .collect();
+        let payload = LLMRequest {
+            model: payload.model.clone(),
+            messages: resolved_messages,
+            max_tokens: payload.max_tokens,
+            temperature: payload.temperature,
+        };
         let is_anthropic = endpoint.url.contains("anthropic.com");
         let is_gemini = endpoint.url.contains("googleapis.com");
-        let default_model = Self::default_model(endpoint, payload);
+        let default_model = Self::default_model(endpoint, &payload);
 
         let mut req = self.client.post(&endpoint.url);
         req = req.header("Content-Type", "application/json");
@@ -287,9 +306,24 @@ impl ServiceAdapter<LLMRequest, LLMResponse> for LLMAdapter {
         auth_header: Option<(&str, &str)>,
     ) -> Result<(BoxStream<'static, Result<String, AdapterError>>, BudgetDeduction), AdapterError>
     {
+        let resolved_messages: Vec<LLMMessage> = payload
+            .messages
+            .iter()
+            .map(|m| LLMMessage {
+                role: m.role.clone(),
+                content: crate::spill::resolve_spilled_string(&m.content)
+                    .unwrap_or_else(|| m.content.clone()),
+            })
+            .collect();
+        let payload = LLMRequest {
+            model: payload.model.clone(),
+            messages: resolved_messages,
+            max_tokens: payload.max_tokens,
+            temperature: payload.temperature,
+        };
         let is_anthropic = endpoint.url.contains("anthropic.com");
         let is_gemini = endpoint.url.contains("googleapis.com");
-        let default_model = Self::default_model(endpoint, payload);
+        let default_model = Self::default_model(endpoint, &payload);
 
         let mut req = self.client.post(&endpoint.url);
         req = req.header("Content-Type", "application/json");
@@ -376,7 +410,7 @@ impl ServiceAdapter<LLMRequest, LLMResponse> for LLMAdapter {
             done: false,
         };
 
-        let est = self.estimate_budget(payload);
+        let est = self.estimate_budget(&payload);
         Ok((Box::pin(token_stream), est))
     }
 }

@@ -425,3 +425,153 @@ async fn test_service_pool_idempotency_in_flight_coalescing() {
 
     pool.drain(2000).await;
 }
+
+#[test]
+fn test_overload_signal_tightens_rpm_and_tpm() {
+    let limiter = MultiResourceLimiter::new(ResourceBudgetConfig {
+        rpm: Some(100.0),
+        tpm: Some(1000.0),
+        ..Default::default()
+    });
+    assert_eq!(limiter.effective_rpm(), Some(100.0));
+    assert_eq!(limiter.effective_tpm(), Some(1000.0));
+    limiter.apply_overload_signal(40);
+    assert!(limiter.is_signal_tightened());
+    assert_eq!(limiter.effective_rpm(), Some(50.0));
+    assert_eq!(limiter.effective_tpm(), Some(500.0));
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(!limiter.is_signal_tightened());
+    assert_eq!(limiter.effective_rpm(), Some(100.0));
+    assert_eq!(limiter.effective_tpm(), Some(1000.0));
+}
+
+#[test]
+fn test_tpm_reconcile_overshoot_bias() {
+    let limiter = MultiResourceLimiter::new(ResourceBudgetConfig {
+        tpm: Some(10_000.0),
+        ..Default::default()
+    });
+    assert_eq!(limiter.tpm_estimate_bias(), 1.0);
+    assert!(limiter.try_acquire(&BudgetDeduction {
+        tpm: Some(100.0),
+        ..Default::default()
+    }));
+    limiter.reconcile(
+        &BudgetDeduction {
+            tpm: Some(100.0),
+            ..Default::default()
+        },
+        &BudgetDeduction {
+            tpm: Some(250.0),
+            ..Default::default()
+        },
+    );
+    assert!(limiter.tpm_estimate_bias() > 1.0);
+    assert!(limiter.is_signal_tightened());
+    assert!(limiter.effective_tpm().unwrap() < 10_000.0);
+}
+
+#[test]
+fn test_tokenizer_and_blob_spill() {
+    assert!(estimate_tokens("hello world") >= 2);
+    let dir = std::env::temp_dir().join(format!(
+        "factioner-spill-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let store = BlobSpillStore::new(&dir, Some(32), None).expect("spill store");
+    let big = "x".repeat(64);
+    let spilled = store.spill_value(serde_json::json!({
+        "base64Source": big,
+        "modelId": "prebuilt"
+    }));
+    let uri = spilled["base64Source"].as_str().unwrap();
+    assert!(uri.starts_with("spill://"));
+    let resolved = store.resolve_value(spilled.clone());
+    assert_eq!(resolved["base64Source"].as_str().unwrap(), big);
+    store.delete_payload_spills(&spilled);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn test_bootstrap_from_config_registers_pools() {
+    assert_eq!(
+        normalize_service_type("doc-intel"),
+        "document_intelligence"
+    );
+    let boot = bootstrap_from_config(BootstrapOptions {
+        use_mock: true,
+        loaded: Some(LoadedConfig {
+            source_path: None,
+            file: FactionFileConfig {
+                gateway: Some(GatewayFileConfig {
+                    host: Some("127.0.0.1".into()),
+                    port: Some(18080),
+                    api_key: Some("test".into()),
+                    max_body_bytes: Some(1024),
+                    spill_dir: None,
+                    spill_threshold_bytes: None,
+                }),
+                pools: Some(vec![PoolFileConfig {
+                    name: "embed-pool".into(),
+                    service_type: "embedding".into(),
+                    endpoints: vec![EndpointConfig {
+                        id: "e1".into(),
+                        url: "https://api.openai.com/v1/embeddings".into(),
+                        max_concurrency: 2,
+                        budget: Some(ResourceBudgetConfig {
+                            rpm: Some(60.0),
+                            tpm: Some(10_000.0),
+                            ..Default::default()
+                        }),
+                        weight: Some(1.0),
+                        priority_tier: Some(0),
+                        cost_per_request: None,
+                        credential: None,
+                        timeout_ms: None,
+                        metadata: Default::default(),
+                    }],
+                    max_retries: Some(1),
+                    backpressure: None,
+                    circuit_breaker: None,
+                    enable_pii_redaction: Some(false),
+                }]),
+                tenants: Some(vec![TenantConfig {
+                    id: "t1".into(),
+                    max_rps: Some(5.0),
+                    max_tpm: None,
+                    max_concurrency: None,
+                    daily_quota: None,
+                    max_allowed_priority: None,
+                    priority_bonus: None,
+                }]),
+            },
+        }),
+    })
+    .await
+    .expect("bootstrap");
+    assert_eq!(boot.pool_names, vec!["embed-pool".to_string()]);
+    assert!(boot.registry.get("embed-pool").await.is_some());
+}
+
+#[test]
+fn test_doc_intel_and_embedding_budget_estimates() {
+    let doc = DocumentIntelligenceAdapter::new();
+    let doc_est = doc.estimate_budget(&DocumentAnalysisRequest {
+        url_source: Some("https://example.com/a.pdf".into()),
+        ..Default::default()
+    });
+    assert_eq!(doc_est.pages, Some(1.0));
+
+    let emb = EmbeddingAdapter::new();
+    let emb_est = emb.estimate_budget(&EmbeddingRequest {
+        model: None,
+        input: EmbeddingInput::Text("hello embeddings".into()),
+        dimensions: None,
+        encoding_format: None,
+    });
+    assert!(emb_est.tpm.unwrap() >= 1.0);
+}

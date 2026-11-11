@@ -237,6 +237,8 @@ pub struct BudgetUsageMetrics {
     pub pages: f64,
     pub effective_rpm: Option<f64>,
     pub effective_tpm: Option<f64>,
+    /// Estimate inflation from usage overshoot (1 = none).
+    pub tpm_estimate_bias: f64,
     pub signal_tightened: bool,
 }
 

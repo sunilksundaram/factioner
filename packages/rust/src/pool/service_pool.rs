@@ -906,9 +906,8 @@ impl<TReq: Clone + Send + Sync + serde::Serialize + serde::de::DeserializeOwned 
             }
             Err(classification) => {
                 if classification.class == FailureClass::Overloaded {
-                    if let Some(ra) = classification.retry_after_ms {
-                        ep.budget_limiter.apply_overload_signal(ra);
-                    }
+                    let ra = classification.retry_after_ms.unwrap_or(1000);
+                    ep.budget_limiter.apply_overload_signal(ra);
                 }
 
                 ep.release_slot(

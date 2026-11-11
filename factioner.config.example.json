@@ -3,7 +3,9 @@
     "host": "127.0.0.1",
     "port": 8080,
     "apiKey": null,
-    "maxBodyBytes": 10485760
+    "maxBodyBytes": 10485760,
+    "spillDir": "./.factioner-spill",
+    "spillThresholdBytes": 262144
   },
   "pools": [
     {

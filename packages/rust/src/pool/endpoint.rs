@@ -215,6 +215,7 @@ impl EndpointInstance {
                 pages,
                 effective_rpm: self.budget_limiter.effective_rpm(),
                 effective_tpm: self.budget_limiter.effective_tpm(),
+                tpm_estimate_bias: self.budget_limiter.tpm_estimate_bias(),
                 signal_tightened: self.budget_limiter.is_signal_tightened(),
             },
         }

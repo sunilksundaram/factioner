@@ -1,5 +1,8 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   PriorityJobQueue,
   AdmissionController,
@@ -13,7 +16,14 @@ import {
   GenericHttpAdapter,
   JobPriority,
   normalizeAdmissionPolicy,
-  normalizeCredential
+  normalizeCredential,
+  estimateTokens,
+  BlobSpillStore,
+  SPILL_URI_PREFIX,
+  bootstrapFromConfig,
+  createAdapterForServiceType,
+  normalizeServiceType,
+  PoolRegistry
 } from './index.js';
 import { MultiResourceLimiter } from './backpressure/resource-budget.js';
 
@@ -316,17 +326,76 @@ describe('Factioner Hardened Test Suite', () => {
     assert.strictEqual(d.delayMs, 2000);
   });
 
-  test('MultiResourceLimiter overload signal tightens then restores RPM', () => {
+  test('MultiResourceLimiter overload signal tightens then restores RPM and TPM', () => {
     const limiter = new MultiResourceLimiter({ rpm: 100, tpm: 1000 });
     assert.strictEqual(limiter.getEffectiveRpm(), 100);
+    assert.strictEqual(limiter.getEffectiveTpm(), 1000);
     limiter.applyOverloadSignal(50);
     assert.ok(limiter.isSignalTightened());
     assert.strictEqual(limiter.getEffectiveRpm(), 50);
+    assert.strictEqual(limiter.getEffectiveTpm(), 500);
     // After expiry, restore
     const until = Date.now() + 60;
     while (Date.now() < until) { /* spin */ }
     assert.strictEqual(limiter.isSignalTightened(), false);
     assert.strictEqual(limiter.getEffectiveRpm(), 100);
+    assert.strictEqual(limiter.getEffectiveTpm(), 1000);
+  });
+
+  test('MultiResourceLimiter reconcile overshoot biases TPM estimates', () => {
+    const limiter = new MultiResourceLimiter({ tpm: 10_000 });
+    assert.strictEqual(limiter.getTpmEstimateBias(), 1);
+    assert.ok(limiter.tryAcquire({ tpm: 100 }));
+    limiter.reconcile({ tpm: 100 }, { tpm: 250 });
+    assert.ok(limiter.getTpmEstimateBias() > 1);
+    assert.ok(limiter.isSignalTightened());
+    assert.ok((limiter.getEffectiveTpm() ?? 0) < 10_000);
+  });
+
+  test('bootstrapFromConfig registers pools by serviceType', () => {
+    assert.strictEqual(normalizeServiceType('doc-intel'), 'document_intelligence');
+    assert.ok(createAdapterForServiceType('embedding', true));
+    const registry = PoolRegistry.create();
+    const boot = bootstrapFromConfig({
+      useMock: true,
+      registry,
+      loaded: {
+        file: {
+          pools: [
+            {
+              name: 'embed-pool',
+              serviceType: 'embedding',
+              endpoints: [
+                {
+                  id: 'e1',
+                  url: 'https://api.openai.com/v1/embeddings',
+                  maxConcurrency: 2,
+                  budget: { rpm: 60, tpm: 10000 }
+                }
+              ]
+            }
+          ],
+          tenants: [{ id: 't1', maxRps: 5 }]
+        }
+      }
+    });
+    assert.strictEqual(boot.pools.length, 1);
+    assert.strictEqual(boot.pools[0].name, 'embed-pool');
+    assert.ok(boot.gatewayOptions.maxBodyBytes);
+    assert.ok(registry.get('embed-pool'));
+  });
+
+  test('tokenizer and blob spill round-trip', () => {
+    assert.ok(estimateTokens('hello world') >= 2);
+    const dir = mkdtempSync(join(tmpdir(), 'factioner-spill-'));
+    const store = new BlobSpillStore({ dir, thresholdBytes: 32 });
+    const big = 'x'.repeat(64);
+    const spilled = store.spillPayload({ base64Source: big, modelId: 'prebuilt' });
+    assert.ok(String(spilled.base64Source).startsWith(SPILL_URI_PREFIX));
+    const resolved = store.resolvePayload(spilled);
+    assert.strictEqual(resolved.base64Source, big);
+    store.deletePayloadSpills(spilled);
+    rmSync(dir, { recursive: true, force: true });
   });
 
   test('Operation poll returns snapshot without double-release', async () => {

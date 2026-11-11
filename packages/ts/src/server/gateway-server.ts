@@ -1,6 +1,11 @@
 import * as http from 'node:http';
 import { PoolRegistry } from '../pool/pool-registry.js';
 import { JobPriority } from '../types/index.js';
+import {
+  BlobSpillStore,
+  cleanupSpilledPayload,
+  configureSpillStore
+} from '../spill/blob-spill.js';
 
 export interface GatewayServerOptions {
   port?: number;
@@ -10,6 +15,10 @@ export interface GatewayServerOptions {
   corsOrigins?: string[];
   /** Max request body size in bytes (default 10 MiB). */
   maxBodyBytes?: number;
+  /** Local directory for large-payload spill (enables blob spill). */
+  spillDir?: string;
+  /** Spill string fields at/above this size (default 256 KiB). */
+  spillThresholdBytes?: number;
 }
 
 /**
@@ -23,7 +32,10 @@ export class GatewayServer {
   private readonly allowUnauthenticated: boolean;
   private readonly corsOrigins: string[];
   private readonly maxBodyBytes: number;
+  private readonly spillStore?: BlobSpillStore;
   private readonly registry: PoolRegistry;
+  /** Spilled payloads retained for in-flight LROs until done/cancel. */
+  private readonly operationSpills = new Map<string, Record<string, unknown>>();
 
   constructor(options: GatewayServerOptions = {}, registry: PoolRegistry = PoolRegistry.getInstance()) {
     this.port = options.port ?? 8080;
@@ -33,6 +45,30 @@ export class GatewayServer {
     this.corsOrigins = options.corsOrigins ?? [];
     this.maxBodyBytes = options.maxBodyBytes ?? 10 * 1024 * 1024;
     this.registry = registry;
+    if (options.spillDir) {
+      this.spillStore = new BlobSpillStore({
+        dir: options.spillDir,
+        thresholdBytes: options.spillThresholdBytes
+      });
+      configureSpillStore(this.spillStore);
+    }
+  }
+
+  private operationSpillKey(poolName: string, operationId: string): string {
+    return `${poolName}::${operationId}`;
+  }
+
+  private retainOperationSpill(poolName: string, operationId: string, payload: Record<string, unknown>): void {
+    if (!this.spillStore) return;
+    this.operationSpills.set(this.operationSpillKey(poolName, operationId), payload);
+  }
+
+  private releaseOperationSpill(poolName: string, operationId: string): void {
+    const key = this.operationSpillKey(poolName, operationId);
+    const payload = this.operationSpills.get(key);
+    if (!payload) return;
+    this.operationSpills.delete(key);
+    cleanupSpilledPayload(payload);
   }
 
   public start(): Promise<void> {
@@ -146,8 +182,7 @@ export class GatewayServer {
         return;
       }
 
-      const bodyText = await this.readBody(req);
-      const payload = bodyText ? JSON.parse(bodyText) : {};
+      const payload = await this.readJsonPayload(req);
       const opts = this.extractSubmitOptions(req);
 
       try {
@@ -173,6 +208,8 @@ export class GatewayServer {
         } else {
           res.end(JSON.stringify({ error: err.message }));
         }
+      } finally {
+        cleanupSpilledPayload(payload);
       }
       return;
     }
@@ -186,14 +223,16 @@ export class GatewayServer {
         res.end(JSON.stringify({ error: 'Pool not found' }));
         return;
       }
-      const bodyText = await this.readBody(req);
-      const payload = bodyText ? JSON.parse(bodyText) : {};
+      const poolName = decodeURIComponent(opsMatch[1]);
+      const payload = await this.readJsonPayload(req);
       const opts = this.extractSubmitOptions(req);
       try {
         const handle = await pool.submitOperation(payload, opts);
+        this.retainOperationSpill(poolName, handle.operationId, payload);
         res.writeHead(202, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ operationId: handle.operationId, status: 'running' }));
       } catch (err: any) {
+        cleanupSpilledPayload(payload);
         this.writeError(res, err);
       }
       return;
@@ -214,6 +253,9 @@ export class GatewayServer {
       if (method === 'GET') {
         try {
           const pollRes = await pool.pollOperation(operationId);
+          if (pollRes.done) {
+            this.releaseOperationSpill(poolName, operationId);
+          }
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({
             operationId,
@@ -231,6 +273,7 @@ export class GatewayServer {
       if (method === 'DELETE') {
         try {
           const result = await pool.cancelOperation(operationId);
+          this.releaseOperationSpill(poolName, operationId);
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({
             operationId,
@@ -254,8 +297,7 @@ export class GatewayServer {
         return;
       }
 
-      const bodyText = await this.readBody(req);
-      const payload = bodyText ? JSON.parse(bodyText) : {};
+      const payload = await this.readJsonPayload(req);
       // Pass raw priority — pool.resolvePriority is the single cap point
       const opts = this.extractSubmitOptions(req);
 
@@ -265,6 +307,8 @@ export class GatewayServer {
         res.end(JSON.stringify(result));
       } catch (err: any) {
         this.writeError(res, err);
+      } finally {
+        cleanupSpilledPayload(payload);
       }
       return;
     }
@@ -327,6 +371,13 @@ export class GatewayServer {
       req.on('end', () => resolve(data));
       req.on('error', reject);
     });
+  }
+
+  /** Parse JSON body and optionally spill large fields to disk. */
+  private async readJsonPayload(req: http.IncomingMessage): Promise<Record<string, unknown>> {
+    const bodyText = await this.readBody(req);
+    const payload = bodyText ? (JSON.parse(bodyText) as Record<string, unknown>) : {};
+    return this.spillStore ? this.spillStore.spillPayload(payload) : payload;
   }
 
   private renderDashboardHtml(): string {

@@ -15,6 +15,8 @@ export interface GatewayFileConfig {
   host?: string;
   port?: number;
   maxBodyBytes?: number;
+  spillDir?: string;
+  spillThresholdBytes?: number;
 }
 
 export interface PoolFileConfig {
@@ -199,12 +201,19 @@ export function loadFactionConfig(explicitPath?: string): LoadedConfig {
   const gwHost = envFirst('FACTIONER_GATEWAY_HOST', 'FACTION_GATEWAY_HOST');
   const gwPort = envFirst('FACTIONER_GATEWAY_PORT', 'FACTION_GATEWAY_PORT');
   const gwBody = envFirst('FACTIONER_GATEWAY_MAX_BODY_BYTES', 'FACTION_GATEWAY_MAX_BODY_BYTES');
-  if (gwKey || gwHost || gwPort || gwBody) {
+  const gwSpill = envFirst('FACTIONER_GATEWAY_SPILL_DIR', 'FACTION_GATEWAY_SPILL_DIR');
+  const gwSpillThreshold = envFirst(
+    'FACTIONER_GATEWAY_SPILL_THRESHOLD_BYTES',
+    'FACTION_GATEWAY_SPILL_THRESHOLD_BYTES'
+  );
+  if (gwKey || gwHost || gwPort || gwBody || gwSpill || gwSpillThreshold) {
     file.gateway = file.gateway ?? {};
     if (gwKey) file.gateway.apiKey = gwKey;
     if (gwHost) file.gateway.host = gwHost;
     if (gwPort) file.gateway.port = Number(gwPort);
     if (gwBody) file.gateway.maxBodyBytes = Number(gwBody);
+    if (gwSpill) file.gateway.spillDir = gwSpill;
+    if (gwSpillThreshold) file.gateway.spillThresholdBytes = Number(gwSpillThreshold);
   }
 
   if (file.tenants) {

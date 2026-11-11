@@ -7,9 +7,17 @@ interface ResourceWindow {
   windowStart: number;
 }
 
+/** When actual TPM exceeds estimate by this ratio, apply temporary TPM pressure. */
+const TPM_OVERSHOOT_RATIO = 1.25;
+/** Cap on reconcile-driven estimate inflation (never unbounded). */
+const MAX_TPM_ESTIMATE_BIAS = 2.0;
+/** Duration of reconcile-driven TPM bias when no Retry-After is present. */
+const TPM_BIAS_DEFAULT_MS = 30_000;
+
 /**
  * MultiResourceLimiter enforces multi-dimensional quotas (RPM, TPM, Pages/min, RPS)
- * with fixed time-window reset and optional temporary RPM tightening from overload signals.
+ * with fixed time-window reset and temporary RPM/TPM tightening from overload signals
+ * and usage-reconcile overshoot (E3).
  */
 export class MultiResourceLimiter {
   private readonly rpmWindow?: ResourceWindow;
@@ -20,6 +28,12 @@ export class MultiResourceLimiter {
   private readonly baselineRpm?: number;
   private effectiveRpm?: number;
   private rpmSignalUntilMs?: number;
+
+  private readonly baselineTpm?: number;
+  private effectiveTpm?: number;
+  private tpmSignalUntilMs?: number;
+  /** Multiplier applied to estimated TPM on acquire (from reconcile overshoot). */
+  private tpmEstimateBias: number = 1;
   private signalTightened: boolean = false;
 
   constructor(config: ResourceBudgetConfig = {}) {
@@ -28,6 +42,7 @@ export class MultiResourceLimiter {
       this.rpmWindow = { limit: config.rpm, windowMs: 60000, consumed: 0, windowStart: Date.now() };
     }
     if (config.tpm && config.tpm > 0) {
+      this.baselineTpm = config.tpm;
       this.tpmWindow = { limit: config.tpm, windowMs: 60000, consumed: 0, windowStart: Date.now() };
     }
     if (config.pagesPerMin && config.pagesPerMin > 0) {
@@ -42,11 +57,20 @@ export class MultiResourceLimiter {
     if (this.rpmSignalUntilMs !== undefined && now >= this.rpmSignalUntilMs) {
       this.effectiveRpm = undefined;
       this.rpmSignalUntilMs = undefined;
-      this.signalTightened = false;
       if (this.rpmWindow && this.baselineRpm) {
         this.rpmWindow.limit = this.baselineRpm;
       }
     }
+    if (this.tpmSignalUntilMs !== undefined && now >= this.tpmSignalUntilMs) {
+      this.effectiveTpm = undefined;
+      this.tpmSignalUntilMs = undefined;
+      this.tpmEstimateBias = 1;
+      if (this.tpmWindow && this.baselineTpm) {
+        this.tpmWindow.limit = this.baselineTpm;
+      }
+    }
+    this.signalTightened =
+      this.rpmSignalUntilMs !== undefined || this.tpmSignalUntilMs !== undefined;
   }
 
   private currentRpmLimit(now: number): number | undefined {
@@ -55,18 +79,44 @@ export class MultiResourceLimiter {
     return this.baselineRpm;
   }
 
+  private currentTpmLimit(now: number): number | undefined {
+    this.restoreSignalIfExpired(now);
+    if (this.effectiveTpm !== undefined) return this.effectiveTpm;
+    return this.baselineTpm;
+  }
+
+  private tightenTpm(now: number, retryAfterMs: number, factor: number): void {
+    if (!this.baselineTpm || !this.tpmWindow) return;
+    const tightened = Math.min(
+      this.baselineTpm,
+      Math.max(1, Math.floor(this.baselineTpm * factor))
+    );
+    this.effectiveTpm = tightened;
+    this.tpmWindow.limit = tightened;
+    const until = now + Math.max(1, retryAfterMs);
+    this.tpmSignalUntilMs =
+      this.tpmSignalUntilMs !== undefined ? Math.max(this.tpmSignalUntilMs, until) : until;
+    this.signalTightened = true;
+  }
+
   /**
-   * Temporarily tighten effective RPM on OVERLOADED + Retry-After.
+   * Temporarily tighten effective RPM and TPM on OVERLOADED + Retry-After.
    * Never raises above the declared baseline.
    */
   public applyOverloadSignal(retryAfterMs: number): void {
-    if (!this.baselineRpm || !this.rpmWindow) return;
     const now = Date.now();
-    const tightened = Math.min(this.baselineRpm, Math.max(1, this.baselineRpm / 2));
-    this.effectiveRpm = tightened;
-    this.rpmWindow.limit = tightened;
-    this.rpmSignalUntilMs = now + Math.max(1, retryAfterMs);
-    this.signalTightened = true;
+    const untilMs = Math.max(1, retryAfterMs);
+
+    if (this.baselineRpm && this.rpmWindow) {
+      const tightened = Math.min(this.baselineRpm, Math.max(1, this.baselineRpm / 2));
+      this.effectiveRpm = tightened;
+      this.rpmWindow.limit = tightened;
+      this.rpmSignalUntilMs = now + untilMs;
+      this.signalTightened = true;
+    }
+
+    // Mirror RPM path for TPM (halve effective cap).
+    this.tightenTpm(now, untilMs, 0.5);
   }
 
   public getEffectiveRpm(): number | undefined {
@@ -74,7 +124,13 @@ export class MultiResourceLimiter {
   }
 
   public getEffectiveTpm(): number | undefined {
-    return this.tpmWindow?.limit;
+    return this.currentTpmLimit(Date.now());
+  }
+
+  /** Current estimate inflation from usage overshoot (1 = none). */
+  public getTpmEstimateBias(): number {
+    this.restoreSignalIfExpired(Date.now());
+    return this.tpmEstimateBias;
   }
 
   public isSignalTightened(): boolean {
@@ -89,6 +145,12 @@ export class MultiResourceLimiter {
     }
   }
 
+  private biasedTpmNeed(estimate: BudgetDeduction, now: number): number | undefined {
+    if (estimate.tpm === undefined) return undefined;
+    this.restoreSignalIfExpired(now);
+    return estimate.tpm * this.tpmEstimateBias;
+  }
+
   public hasAvailable(estimate: BudgetDeduction = { rpm: 1 }): boolean {
     const now = Date.now();
     this.restoreSignalIfExpired(now);
@@ -99,9 +161,11 @@ export class MultiResourceLimiter {
       if (this.rpmWindow.consumed + (estimate.rpm ?? 1) > limit) return false;
     }
 
-    if (this.tpmWindow && estimate.tpm) {
+    const tpmNeed = this.biasedTpmNeed(estimate, now);
+    if (this.tpmWindow && tpmNeed !== undefined) {
       this.refreshWindow(this.tpmWindow, now);
-      if (this.tpmWindow.consumed + estimate.tpm > this.tpmWindow.limit) return false;
+      const limit = this.currentTpmLimit(now) ?? this.tpmWindow.limit;
+      if (this.tpmWindow.consumed + tpmNeed > limit) return false;
     }
 
     if (this.pagesWindow && estimate.pages) {
@@ -125,9 +189,10 @@ export class MultiResourceLimiter {
       this.refreshWindow(this.rpmWindow, now);
       this.rpmWindow.consumed += estimate.rpm ?? 1;
     }
-    if (this.tpmWindow && estimate.tpm) {
+    const tpmNeed = this.biasedTpmNeed(estimate, now);
+    if (this.tpmWindow && tpmNeed !== undefined) {
       this.refreshWindow(this.tpmWindow, now);
-      this.tpmWindow.consumed += estimate.tpm;
+      this.tpmWindow.consumed += tpmNeed;
     }
     if (this.pagesWindow && estimate.pages) {
       this.refreshWindow(this.pagesWindow, now);
@@ -149,6 +214,13 @@ export class MultiResourceLimiter {
       const estTpm = estimated.tpm ?? 0;
       const actTpm = actual.tpm ?? 0;
       this.tpmWindow.consumed = Math.max(0, this.tpmWindow.consumed + (actTpm - estTpm));
+
+      // E3 usage→TPM bias: repeated/large overshoot tightens effective TPM + inflates future estimates.
+      if (estTpm > 0 && actTpm > estTpm * TPM_OVERSHOOT_RATIO && this.baselineTpm) {
+        const ratio = actTpm / estTpm;
+        this.tpmEstimateBias = Math.min(MAX_TPM_ESTIMATE_BIAS, Math.max(this.tpmEstimateBias, ratio));
+        this.tightenTpm(now, TPM_BIAS_DEFAULT_MS, 1 / Math.min(ratio, 2));
+      }
     }
 
     if (this.pagesWindow) {
@@ -164,7 +236,8 @@ export class MultiResourceLimiter {
       this.rpmWindow.consumed = Math.max(0, this.rpmWindow.consumed - (deduction.rpm ?? 1));
     }
     if (this.tpmWindow && deduction.tpm) {
-      this.tpmWindow.consumed = Math.max(0, this.tpmWindow.consumed - deduction.tpm);
+      const bias = this.tpmEstimateBias || 1;
+      this.tpmWindow.consumed = Math.max(0, this.tpmWindow.consumed - deduction.tpm * bias);
     }
     if (this.pagesWindow && deduction.pages) {
       this.pagesWindow.consumed = Math.max(0, this.pagesWindow.consumed - deduction.pages);

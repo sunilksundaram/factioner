@@ -32,6 +32,9 @@ export * from './adapters/mock-adapter.js';
 export * from './telemetry/metrics.js';
 export * from './server/gateway-server.js';
 export * from './config/load-config.js';
+export * from './utils/tokenizer.js';
+export * from './spill/blob-spill.js';
+export * from './bootstrap.js';
 
 import { ServicePool } from './pool/service-pool.js';
 import { ServicePoolOptions } from './types/index.js';
